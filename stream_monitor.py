@@ -50,25 +50,31 @@ class PcrExtractAnalyze(object):
 
     def _handle_new_pts(self, pid, pts):
         if pid in self.pts_dict:
-            pts_seq_duration = (self.pts_dict[pid].pts_seq.max() - self.pts_dict[pid].pts_seq.min())
-            if (self.pts_dict[pid].state == 'priming') and \
-               (pts_seq_duration > 2.0):
-                self.pts_dict[pid].pts_seq.append(pd.Series([pts/90000.0]), ignore_index=True)
-                self.pts_dict[pid].state = "steady"
-                self.pts_dict[pid].median_pts_diff = self.pts_dict[pid].diff.median()
-                self.pts_dict[pid].last_out_pts = self.pts_dict[pid].pts_seq.min()
+            if (self.pts_dict[pid].state == 'priming'):
+                pts_seq_duration = (self.pts_dict[pid].pts_seq.max() -
+                                    self.pts_dict[pid].pts_seq.min())
+                self.pts_dict[pid].pts_seq = self.pts_dict[pid].pts_seq.append(
+                        pd.Series([pts/90000.0]), ignore_index=True)
+                if (pts_seq_duration > 2.0):
+                    self.pts_dict[pid].state = "steady"
+                    self.pts_dict[pid].median_pts_diff = self.pts_dict[pid].pts_seq.diff().median()
+                    self.pts_dict[pid].last_out_pts = self.pts_dict[pid].pts_seq.min()
             elif self.pts_dict[pid].state == 'steady':
                 if self.pts_dict[pid].median_pts_diff < 0.5:
-                    self.pts_dict[pid].pts_seq.append(pd.Series([pts/90000.0]), ignore_index=True)
+                    self.pts_dict[pid].pts_seq = self.pts_dict[pid].pts_seq.append(
+                                                   pd.Series([pts/90000.0]),
+                                                   ignore_index=True)
                     # Pid seems to be audio video data
                     min_pts = self.pts_dict[pid].pts_seq.min()
                     diff_wrto_last_pts = abs(min_pts - self.pts_dict[pid].last_out_pts)
                     self.pts_dict[pid].last_out_pts = min_pts
                     if diff_wrto_last_pts > (1.5 * self.pts_dict[pid].median_pts_diff):
+                        print(min_pts, self.pts_dict[pid].last_out_pts)
                         log.error((f"event=pts_discontinuity, pid={pid},"
                                    f"diff={diff_wrto_last_pts}, "
                                    f"expected_diff={self.pts_dict[pid].median_pts_diff}"))
-                    self.pts_dict[pid].pts_seq.drop(self.pts_dict[pid].pts_seq.idxmin())
+                    self.pts_dict[pid].pts_seq = self.pts_dict[pid].pts_seq.drop(
+                            self.pts_dict[pid].pts_seq.idxmin())
         else:
             self.pts_dict[pid] = PtsInfo('priming', 0.0, pts, pd.Series())
 
@@ -89,7 +95,7 @@ class PcrExtractAnalyze(object):
 
     def analyze_line(self, line):
         (ts_type, pid, pts) = PcrExtractAnalyze._parse_line(line)
-        if ts_type == "pts":
+        if ts_type == "PTS":
             self._handle_new_pts(pid, pts)
 
 
@@ -141,9 +147,14 @@ class StreamMon(object):
     def tsduck_process(self):
         cmd = f"tsp  --max-input-packets 50 --max-flushed-packets 50 -t -I file {self.fifo_name} -P pcrextract --log  -P continuity -O drop"
         args = shlex.split(cmd)
-        self.tsduck_pid = subprocess.Popen(args, stdout=subprocess.PIPE)
-        for line in self.tsduck_pid.stdout:
-            self.tsduck_analyze.analyze(line)
+        self.tsduck_pid = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        count=0
+        for line in self.tsduck_pid.stderr:
+            self.tsduck_analyze.analyze(line.decode())
+            count += 1
+            if count > 500:
+                print("All izz well")
+                count = 0
 
 
 def main():
