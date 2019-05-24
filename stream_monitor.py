@@ -10,8 +10,9 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
-import pandas as pd
 import logger
+from numpy import array
+import queue
 
 #global log
 
@@ -20,7 +21,8 @@ class PtsInfo:
     state: str # Can be 'priming' or 'steady'
     median_pts_diff: float
     last_out_pts: float
-    pts_seq: pd.Series
+    pts_seq: queue.PriorityQueue
+    dur_est_list: list
 
 class StreamHealthLog(object):
     def __init__(self):
@@ -80,26 +82,35 @@ class PcrExtractAnalyze(object):
         self.pts_dict = {}
         self.stream_health_log = stream_health_log
 
+    def _median_diff(self, l):
+        l.sort()
+        arr_l = array(l)
+        diff = arr_l[1:] - arr_l[0:-1]
+        return diff[int(len(diff)/2)]
+
+
     def _handle_new_pts(self, pid, pts):
         if pid in self.pts_dict:
-            pts_seq_duration = (self.pts_dict[pid].pts_seq.max() -
-                                self.pts_dict[pid].pts_seq.min())
-            self.pts_dict[pid].pts_seq = self.pts_dict[pid].pts_seq.append(
-                    pd.Series([pts/90000.0]), ignore_index=True)
+            qlen = self.pts_dict[pid].pts_seq.qsize()
+            self.pts_dict[pid].pts_seq.put(pts/90000.)
             if (self.pts_dict[pid].state == 'priming'):
-                if (pts_seq_duration > 2.0):
+                self.pts_dict[pid].dur_est_list.append(pts/90000.)
+                if len(self.pts_dict[pid].dur_est_list) > 20:
                     self.pts_dict[pid].state = "steady"
-                    self.pts_dict[pid].median_pts_diff = (self.pts_dict[pid].
-                                              pts_seq.sort_values().diff().median())
-                    self.pts_dict[pid].last_out_pts = self.pts_dict[pid].pts_seq.min()
+                    self.pts_dict[pid].median_pts_diff = \
+                         self._median_diff(self.pts_dict[pid].dur_est_list)
+                    print(self.pts_dict[pid].median_pts_diff)
+                    self.pts_dict[pid].last_out_pts = min(self.pts_dict[pid].dur_est_list)
+                    self.pts_dict[pid].dur_est_list = []
             elif self.pts_dict[pid].state == 'steady':
-                if self.pts_dict[pid].median_pts_diff < 0.5 and (pts_seq_duration > 2.0):
+                if self.pts_dict[pid].median_pts_diff < 0.5 and (qlen > 20):
                     #self.pts_dict[pid].pts_seq = self.pts_dict[pid].pts_seq.append(
                     #                               pd.Series([pts/90000.0]),
                     #                               ignore_index=True)
                     # Pid seems to be audio video data
-                    min_pts = self.pts_dict[pid].pts_seq.min()
+                    min_pts = self.pts_dict[pid].pts_seq.get()
                     diff_wrto_last_pts = abs(min_pts - self.pts_dict[pid].last_out_pts)
+                    print(diff_wrto_last_pts, self.pts_dict[pid].median_pts_diff)
                     if diff_wrto_last_pts > (1.5 * self.pts_dict[pid].median_pts_diff):
                         print(min_pts, self.pts_dict[pid].last_out_pts)
                         self.stream_health_log.pts_err_seen()
@@ -111,11 +122,9 @@ class PcrExtractAnalyze(object):
                         # Flushing all entries in pts_seq
                         self.pts_dict.pop(pid)
                     else:
-                        self.pts_dict[pid].pts_seq = self.pts_dict[pid].pts_seq.drop(
-                                self.pts_dict[pid].pts_seq.idxmin())
                         self.pts_dict[pid].last_out_pts = min_pts
         else:
-            self.pts_dict[pid] = PtsInfo('priming', 0.0, pts, pd.Series())
+            self.pts_dict[pid] = PtsInfo('priming', 0.0, pts, queue.PriorityQueue(), [])
 
     @staticmethod
     def _parse_line(line):
@@ -186,13 +195,15 @@ class StreamMon(object):
         args = shlex.split(cmd)
         self.strm_recv_pid = subprocess.Popen(args)
 
-    def tsduck_process(self, port=None):
+    def tsduck_process(self, port=None, file=None):
         if self.protocol == 'rtp':
             cmd = f"tsp  --max-input-packets 50 --max-flushed-packets 50 -t -I file {self.fifo_name} -P pcrextract --log  -P continuity -O drop"
         elif self.protocol == 'udp':
             cmd = f"tsp  --max-input-packets 50 --max-flushed-packets 50 -t -I ip {port} -P pcrextract --log  -P continuity -O drop"
+        elif self.protocol == 'file':
+            cmd = f"tsp  --max-input-packets 50 --max-flushed-packets 50 -t -I file {file} -P pcrextract --log  -P continuity -O drop"
         args = shlex.split(cmd)
-        self.tsduck_pid = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.tsduck_pid = subprocess.Popen(args, bufsize=81920000, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         count=0
         for line in self.tsduck_pid.stderr:
             self.tsduck_analyze.analyze(line.decode())
@@ -204,14 +215,19 @@ class StreamMon(object):
 
 def main():
     if len(sys.argv) < 3:
-       print("Usage: python stream_monitor.py <protocol(rtp|udp> port")
+       print("Usage: python stream_monitor.py <protocol(rtp|udp|file> <port|filename>")
        sys.exit(1)
     protocol = (sys.argv[1])
-    inp_port = int(sys.argv[2])
     strm_mon = StreamMon(protocol)
     if protocol == "rtp":
+        inp_port = int(sys.argv[2])
         strm_mon.rtp_inp_to_fifo(inp_port)
-    strm_mon.tsduck_process(port=inp_port)
+    if protocol == 'file':
+        inp_file = (sys.argv[2])
+        strm_mon.tsduck_process(file=inp_file)
+    else:
+        inp_port = int(sys.argv[2])
+        strm_mon.tsduck_process(port=inp_port)
     while True:
         time.sleep(5)
 
